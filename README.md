@@ -1,0 +1,1 @@
+This notebook compares the predictive accuracy of RF and leakage-safe RFSI for zink values under three environmental covariate scenarios using five-fold cross-validation and additional sensitivity analyses.
