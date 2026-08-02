@@ -1,0 +1,1099 @@
+---
+title: RFSI versus non-spatial Random Forest for Meuse zinc
+jupyter:
+  kernelspec:
+    display_name: Python (geo)
+    language: python
+    name: geo
+---
+
+
+## A leakage-safe 5-fold cross-validation workflow (in Python)
+#### *by Olha Kachalova*
+
+### Research questions:
+1. Is zinc prediction more accurate when Random Forest Spatial Interpolation (RFSI) is used instead of a Random Forest (RF) that ignores sample locations?
+2. Does adding flood-related and soil covariates change the result?
+
+### What this workflow does:
+
+1. comparing RF and RFSI on exactly the same five folds;
+2. repeating the comparison under three matched covariate scenarios;
+3. constructing nearest-observation features separately inside every fold, preventing target leakage;
+4. reporting RMSE, MAE, $R^2$, mean error and Lin's concordance correlation coefficient (CCC);
+5. evaluating the *paired* difference between methods, rather than comparing two unrelated scores;
+6. fitting both methods to all observations and mapping zinc over `meuse.grid`.
+7. Optional sensitivity analyses:
+   - to the number of neighbours;
+   - repeated 5-fold;
+   - log-transformation of zink values
+
+
+### Main references
+
+- Sekulić, A. et al. (2020), [Random Forest Spatial Interpolation](https://doi.org/10.3390/rs12101687), *Remote Sensing*, 12, 1687.
+- OpenGeoHub, [Spatial interpolation using ML and geographical distances to neighbours](https://opengeohub.github.io/spatial-prediction-eml/spatial-interpolation-using-ensemble-ml.html#spatial-interpolation-using-ml-and-geographical-distances-to-neighbors).
+- OpenGeoHub, [Spatial and spatiotemporal interpolation using Ensemble Machine Learning](https://opengeohub.github.io/spatial-prediction-eml/).
+- `sp` documentation for the [Meuse observations](https://edzer.github.io/sp/reference/meuse.html) and [Meuse prediction grid](https://edzer.github.io/sp/reference/meuse.grid.html).
+
+
+## 1. Some theory
+
+Let $z(s)$ be zinc at location $s$, and let $c(s)$ contain environmental covariates.
+
+### RF that ignores locations
+
+The non-spatial model is
+
+$$\hat z(s_0)=f_{RF}\{c(s_0)\}.$$
+
+Coordinates `x` and `y`, distances to sample points, and neighbouring zinc observations are deliberately excluded. The model can still reproduce spatial patterns *indirectly* when environmental covariates themselves are spatially structured. Here, `dist` means distance to the Meuse river; it is an environmental covariate, not the location coordinates.
+
+### RFSI
+
+RFSI augments the same environmental covariates with the values and distances of the $k$ nearest observed samples:
+
+$$\hat z(s_0)=f_{RF}\{c(s_0),z(s_{(1)}),\ldots,z(s_{(k)}),d_{(1)},\ldots,d_{(k)}\}.$$
+
+The neighbours are ordered by distance from the prediction location. RFSI is therefore similar in spirit to kriging or IDW because nearby measured responses directly inform a prediction, but RF learns a nonlinear, non-parametric combination instead of imposing a variogram and a linear weighted average.
+
+## 2. Setting Up the Software
+
+Python libraries needed: `numpy` `pandas` `scipy` `scikit-learn` `matplotlib` `seaborn` `pyreadr`
+
+```{python}
+import os
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
+from pathlib import Path
+from urllib.request import urlretrieve
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pyreadr
+
+from scipy.stats import skew
+from sklearn.cluster import KMeans
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+```
+
+## 3. Meuse dataset: owerview, data integrity checks and explanatory analysis
+
+The observation table has 155 topsoil samples. Zinc is measured in mg kg$^{-1}$ soil. Coordinates use the Dutch RD New projected coordinate system (EPSG:28992), so Euclidean neighbour distances are in metres, which is necessary.
+
+```{python}
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+BASE_URL = "https://raw.githubusercontent.com/edzer/sp/master/data"
+
+
+def load_rda(name):
+    path = DATA_DIR / f"{name}.rda"
+    if not path.exists():
+        print(f"Downloading {name}.rda ...")
+        urlretrieve(f"{BASE_URL}/{name}.rda", path)
+    result = pyreadr.read_r(str(path))
+    return result[name].reset_index(drop=True)
+
+
+meuse = load_rda("meuse")
+grid = load_rda("meuse.grid")
+
+# Force categorical variables to ordinary strings. This avoids accidentally
+# treating class codes as continuous quantities.
+for col in ["ffreq", "soil", "lime", "landuse"]:
+    if col in meuse:
+        meuse[col] = meuse[col].astype(object).where(meuse[col].notna(), "Missing").astype(str)
+for col in ["ffreq", "soil"]:
+    grid[col] = grid[col].astype(object).where(grid[col].notna(), "Missing").astype(str)
+
+print("Observations:", meuse.shape)
+print("Prediction grid:", grid.shape)
+display(meuse.head())
+```
+
+### Data integrity checks
+
+RFSI training features exclude each sample from its own neighbour list. This is easiest and safest when sample coordinates are unique. The checks below fail early if the target or coordinates are missing, the CRS-like coordinate scale is implausible, or duplicated locations occur.
+
+```{python}
+required_obs = {"x", "y", "zinc", "dist", "ffreq", "soil"}
+required_grid = {"x", "y", "dist", "ffreq", "soil"}
+
+assert required_obs.issubset(meuse.columns)
+assert required_grid.issubset(grid.columns)
+assert meuse[["x", "y", "zinc"]].notna().all().all()
+assert not meuse.duplicated(["x", "y"]).any(), "Duplicate coordinates need explicit handling."
+assert meuse["x"].median() > 100_000, "Coordinates do not look like projected RD New metres."
+assert len(meuse) == 155
+
+print(meuse["zinc"].describe())
+print("Zinc skewness:", round(skew(meuse["zinc"], bias=False), 3))
+print("Flood-frequency counts:\n", meuse["ffreq"].value_counts().sort_index())
+```
+
+### Exploratory analysis
+
+Zinc is strongly right-skewed, and high concentrations occur mainly near the river. This matters because RMSE heavily penalizes large errors at high-zinc observations, while MAE describes typical absolute error more robustly. We therefore report both. **Raw zinc is considered the primary target** so results are directly interpretable in mg kg$^{-1}$; a **log-target sensitivity analysis** is offered later in addons.
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+
+sns.histplot(meuse["zinc"], bins=25, kde=True, ax=axes[0], color="#8c2d04")
+axes[0].set_title("Raw zinc")
+axes[0].set_xlabel("Zinc (mg kg$^{-1}$)")
+
+sns.histplot(np.log1p(meuse["zinc"]), bins=25, kde=True, ax=axes[1], color="#2b8cbe")
+axes[1].set_title("log(1 + zinc)")
+
+sc = axes[2].scatter(
+    meuse["x"], meuse["y"], c=meuse["zinc"], s=55,
+    cmap="viridis", edgecolor="black", linewidth=0.25
+)
+axes[2].set_title("Observed zinc")
+axes[2].set_aspect("equal")
+axes[2].set_xlabel("Easting (m)")
+axes[2].set_ylabel("Northing (m)")
+fig.colorbar(sc, ax=axes[2], label="mg kg$^{-1}$")
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+sns.scatterplot(data=meuse, x="dist", y="zinc", hue="ffreq", palette="Set1", ax=axes[0])
+axes[0].set_title("Zinc versus normalized river distance")
+
+sns.boxplot(data=meuse, x="ffreq", y="zinc", order=["1", "2", "3"], ax=axes[1])
+axes[1].set_title("Zinc by flood-frequency class")
+axes[1].set_xlabel("Flood class: 1 frequent → 3 rare")
+plt.tight_layout()
+plt.show()
+```
+
+## 4. Experimental design
+
+We use a factorial comparison so that the RFSI effect is not confused with the covariate effect.
+
+| Covariate scenario | Environmental predictors available at points and grid | Purpose |
+|---|---|---|
+| `distance_only` | `dist` | Minimal environmental baseline: normalized distance to the river |
+| `distance_flood` | `dist`, `ffreq` | Adds inundation frequency |
+| `distance_flood_soil` | `dist`, `ffreq`, `soil` | Adds inundation frequency and mapped soil type |
+
+Within each scenario:
+
+- **RF** uses only the listed environmental predictors.
+- **RFSI** uses the same predictors plus $k$ nearest zinc observations and their Euclidean distances.
+
+`ffreq` is categorical: class 1 = flooding once in two years, class 2 = once in ten years, and class 3 = once in 50 years. It is one-hot encoded rather than treated as a linear numeric scale. `soil` is also categorical. Comparing distance_ffreq (dist + ffreq) with distance_only (dist) isolates the added contribution of flooding frequency. Comparing distance_ffreq_soil (dist + ffreq + soil) with distance_ffreq (dist + ffreq) isolates the additional contribution of soil type.
+
+**Limitations:**
+According to the dataset documentation, the origin of the gridded flood-frequency map is not known and the gridded soil classes should be treated cautiously.
+
+## 5. Accuracy measures
+
+- **RMSE:** same units as zinc and sensitive to large errors; the primary metric in the RFSI paper.
+- **MAE:** typical absolute error and less dominated by extremes.
+- **$R^2$:** proportional reduction in squared error relative to predicting the overall mean. It can be negative under CV.
+- **Mean error (ME):** signed bias; values near zero are desirable.
+- **CCC:** agreement with the 1:1 line; unlike correlation alone, it penalizes both scale and mean bias.
+
+Scores are computed from all out-of-fold predictions pooled together. Fold scores are retained for diagnostics, but simply averaging five fold $R^2$ values is avoided because folds have different target means and variances.
+
+```{python}
+def concordance_correlation_coefficient(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    cov = np.cov(y_true, y_pred, ddof=1)[0, 1]
+    denominator = (
+        np.var(y_true, ddof=1)
+        + np.var(y_pred, ddof=1)
+        + (np.mean(y_true) - np.mean(y_pred)) ** 2
+    )
+    return 2 * cov / denominator
+
+
+def regression_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return {
+        "RMSE": mean_squared_error(y_true, y_pred) ** 0.5,
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "R2": r2_score(y_true, y_pred),
+        "ME": np.mean(y_pred - y_true),
+        "CCC": concordance_correlation_coefficient(y_true, y_pred),
+    }
+```
+
+## 6. Constructing leakage-safe RFSI predictors
+
+This is the critical step.
+
+For an **outer training sample**, find neighbours only among the outer training samples and remove the sample itself. For an **outer validation sample**, find neighbours only among the outer training samples. The held-out zinc values must never appear in `obs_1`, ..., `obs_k`.
+
+An unsafe workflow would construct nearest-observation predictors once from all 155 samples and then call `cross_val_score`. A validation sample would then often receive its own zinc or another validation zinc as a predictor. The resulting accuracy could look excellent while being invalid.
+
+```{python}
+def nearest_observation_features(
+    reference_xy,
+    reference_z,
+    query_xy,
+    k=10,
+    exclude_self=False,
+):
+    
+    reference_xy = np.asarray(reference_xy, dtype=float)
+    reference_z = np.asarray(reference_z, dtype=float)
+    query_xy = np.asarray(query_xy, dtype=float)
+
+    extra = 1 if exclude_self else 0
+    if k + extra > len(reference_xy):
+        raise ValueError("k is too large for the available reference samples.")
+
+    search = NearestNeighbors(n_neighbors=k + extra, metric="euclidean")
+    search.fit(reference_xy)
+    distances, indices = search.kneighbors(query_xy)
+
+    if exclude_self:
+        # Coordinates were checked as unique; the zero-distance first neighbour
+        # is therefore the row itself and must be removed.
+        if not np.allclose(distances[:, 0], 0):
+            raise ValueError("Self-neighbour was not found at distance zero.")
+        distances = distances[:, 1:]
+        indices = indices[:, 1:]
+
+    data = {}
+    for j in range(k):
+        data[f"obs_{j + 1}"] = reference_z[indices[:, j]]
+    for j in range(k):
+        data[f"nn_distance_{j + 1}"] = distances[:, j]
+    return pd.DataFrame(data)
+```
+
+```{python}
+# Sanity check on the complete sample set. The closest non-self distance must
+# be positive, and obs_1 is another sample's zinc rather than the target itself.
+demo_nn = nearest_observation_features(
+    meuse[["x", "y"]], meuse["zinc"], meuse[["x", "y"]],
+    k=10, exclude_self=True
+)
+assert (demo_nn.filter(like="nn_distance_") > 0).all().all()
+display(pd.concat([meuse[["zinc"]].head(), demo_nn.head()], axis=1))
+```
+
+## 7. Model-building helpers
+
+The same RF settings are used in both methods to isolate the effect of adding RFSI predictors. `max_features="sqrt"` scales the number of candidate variables with feature count, while `min_samples_leaf=2` slightly regularizes the very small dataset. These are fixed *before* looking at outer-fold results; therefore the primary comparison does not require nested tuning.
+
+Categorical encoders and imputers are fitted inside each training fold. Coordinates are used only by the RFSI neighbour search, never as ordinary RF predictors.
+
+```{python}
+RANDOM_STATE = 2026
+N_SPLITS = 5
+K_NEIGHBORS = 10       # same k as the OpenGeoHub Meuse tutorial, is a subject to explore
+N_TREES = 600
+N_JOBS = -1
+CATEGORICAL_COLUMNS = {"ffreq", "soil", "lime", "landuse"}
+
+
+def make_rf_pipeline(feature_columns, random_state=RANDOM_STATE, n_trees=N_TREES):
+    categorical = [c for c in feature_columns if c in CATEGORICAL_COLUMNS]
+    numeric = [c for c in feature_columns if c not in CATEGORICAL_COLUMNS]
+
+    transformers = []
+    if numeric:
+        transformers.append((
+            "numeric",
+            SimpleImputer(strategy="median"),
+            numeric,
+        ))
+    if categorical:
+        transformers.append((
+            "categorical",
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+            ]),
+            categorical,
+        ))
+
+    preprocessing = ColumnTransformer(transformers, remainder="drop")
+    forest = RandomForestRegressor(
+        n_estimators=n_trees,
+        max_features="sqrt",
+        min_samples_leaf=2,
+        bootstrap=True,
+        random_state=random_state,
+        n_jobs=N_JOBS,
+    )
+    return Pipeline([("preprocess", preprocessing), ("rf", forest)])
+
+
+def fold_feature_tables(train, test, environmental_columns, method, k):
+    '''Build train/test predictors using only the fold's training reference set.'''
+    X_train = train[environmental_columns].reset_index(drop=True).copy()
+    X_test = test[environmental_columns].reset_index(drop=True).copy()
+
+    if method == "RFSI":
+        train_nn = nearest_observation_features(
+            train[["x", "y"]], train["zinc"], train[["x", "y"]],
+            k=k, exclude_self=True,
+        )
+        test_nn = nearest_observation_features(
+            train[["x", "y"]], train["zinc"], test[["x", "y"]],
+            k=k, exclude_self=False,
+        )
+        X_train = pd.concat([X_train, train_nn], axis=1)
+        X_test = pd.concat([X_test, test_nn], axis=1)
+    elif method != "RF":
+        raise ValueError("method must be 'RF' or 'RFSI'")
+
+    return X_train, X_test
+```
+
+## 8. Primary shuffled 5-fold cross-validation
+
+The primary resampling design is shuffled 5-fold CV. Because every Meuse sample has a unique location, holding out a row also holds out that location. It estimates **interpolation among a remaining, spatially interspersed sample network**. A spatially clustered 5-fold sensitivity test is included later; it asks the harder question of prediction into withheld geographic subregions and should not be interpreted as the same estimand.
+
+Both methods and both covariate scenarios use the **same folds**, making all comparisons paired. Within every fold, the reference network available to RFSI contains only 80% of the observations. This honestly reproduces the information available when predicting a withheld location.
+
+No target transformation is used in the primary analysis.
+
+```{python}
+sns.set_theme(style="whitegrid", context="notebook")
+pd.set_option("display.max_columns", 100)
+
+def make_random_folds(data, random_state=RANDOM_STATE):
+    splitter = KFold(n_splits=N_SPLITS, shuffle=True, random_state=random_state)
+    return list(splitter.split(data))
+
+
+def cross_validate_method(
+    data,
+    folds,
+    environmental_columns,
+    method,
+    k=K_NEIGHBORS,
+    n_trees=N_TREES,
+):
+    oof = np.full(len(data), np.nan)
+    fold_id = np.full(len(data), -1, dtype=int)
+
+    for fold_number, (train_index, test_index) in enumerate(folds, start=1):
+        train = data.iloc[train_index].reset_index(drop=True)
+        test = data.iloc[test_index].reset_index(drop=True)
+
+        X_train, X_test = fold_feature_tables(
+            train, test, environmental_columns, method, k
+        )
+        model = make_rf_pipeline(
+            X_train.columns.tolist(),
+            random_state=RANDOM_STATE + fold_number,
+            n_trees=n_trees,
+        )
+        model.fit(X_train, train["zinc"])
+        oof[test_index] = model.predict(X_test)
+        fold_id[test_index] = fold_number
+
+    assert np.isfinite(oof).all()
+    return pd.DataFrame({
+        "observed": data["zinc"].to_numpy(),
+        "predicted": oof,
+        "fold": fold_id,
+        "x": data["x"].to_numpy(),
+        "y": data["y"].to_numpy(),
+    })
+
+
+SCENARIOS = {
+    "distance_only": ["dist"],
+    "distance_flood": ["dist", "ffreq"],
+    "distance_flood_soil": ["dist", "ffreq", "soil"],
+}
+
+primary_folds = make_random_folds(meuse)
+predictions = {}
+
+for scenario, columns in SCENARIOS.items():
+    for method in ["RF", "RFSI"]:
+        print(f"Running {scenario} / {method}")
+        predictions[(scenario, method)] = cross_validate_method(
+            meuse, primary_folds, columns, method, k=K_NEIGHBORS
+        )
+```
+
+## 9. Overall and fold-level accuracy
+
+Interpret lower RMSE/MAE and absolute ME, but higher $R^2$/CCC, as better. The table `method_effect` directly answers the main question: a negative `delta_RMSE` means RFSI is more accurate than RF.
+
+Do not call a tiny numerical difference scientifically important merely because it has the preferred sign. Consider its size relative to RF RMSE, its stability across folds and seeds, and its uncertainty.
+
+```{python}
+scenario_order = ["distance_only", "distance_flood", "distance_flood_soil"]
+
+overall_rows = []
+fold_rows = []
+
+for (scenario, method), result in predictions.items():
+    overall_rows.append({
+        "scenario": scenario,
+        "method": method,
+        **regression_metrics(result["observed"], result["predicted"]),
+    })
+    for fold_number, part in result.groupby("fold"):
+        fold_rows.append({
+            "scenario": scenario,
+            "method": method,
+            "fold": fold_number,
+            **regression_metrics(part["observed"], part["predicted"]),
+        })
+
+overall_scores = pd.DataFrame(overall_rows)
+overall_scores["scenario"] = pd.Categorical(
+    overall_scores["scenario"], categories=scenario_order, ordered=True
+)
+overall_scores = overall_scores.sort_values(["scenario", "method"])
+
+fold_scores = pd.DataFrame(fold_rows)
+fold_scores["scenario"] = pd.Categorical(
+    fold_scores["scenario"], categories=scenario_order, ordered=True
+)
+fold_scores = fold_scores.sort_values(["scenario", "fold", "method"])
+
+display(overall_scores.round(3))
+
+wide = overall_scores.pivot(index="scenario", columns="method")
+wide = wide.reindex(scenario_order)
+
+method_effect = pd.DataFrame(index=wide.index)
+method_effect["delta_RMSE"] = wide["RMSE"]["RFSI"] - wide["RMSE"]["RF"]
+method_effect["RMSE_change_percent"] = 100 * method_effect["delta_RMSE"] / wide["RMSE"]["RF"]
+method_effect["delta_MAE"] = wide["MAE"]["RFSI"] - wide["MAE"]["RF"]
+method_effect["delta_R2"] = wide["R2"]["RFSI"] - wide["R2"]["RF"]
+method_effect["delta_CCC"] = wide["CCC"]["RFSI"] - wide["CCC"]["RF"]
+
+display(method_effect.round(3))
+```
+
+```{python}
+scenario_order = ["distance_only", "distance_flood", "distance_flood_soil"]
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+sns.barplot(
+    data=overall_scores, x="scenario", y="RMSE", hue="method",
+    order=scenario_order, ax=axes[0]
+)
+axes[0].set_title("Overall out-of-fold RMSE")
+axes[0].set_ylabel("RMSE (mg kg$^{-1}$)")
+axes[0].tick_params(axis="x", rotation=30)
+
+sns.lineplot(
+    data=fold_scores, x="fold", y="RMSE", hue="method",
+    style="scenario", style_order=scenario_order,
+    markers=True, dashes=True, ax=axes[1]
+)
+axes[1].set_title("Fold-to-fold stability")
+axes[1].set_ylabel("RMSE (mg kg$^{-1}$)")
+
+plt.tight_layout()
+plt.show()
+```
+
+### Residual maps
+
+Spatial clustering of residuals indicates structure not captured by the model. Similar residual clusters in RF and RFSI may reflect missing environmental processes, outliers, or a mismatch between sampling support and raster support. Remember that every point shown below is an out-of-fold prediction.
+
+```{python}
+n_scenarios = len(SCENARIOS)
+fig, axes = plt.subplots(
+    n_scenarios, 2, figsize=(12, 5.2 * n_scenarios),
+    sharex=True, sharey=True, squeeze=False
+)
+residual_limit = max(
+    np.abs(v["predicted"] - v["observed"]).max() for v in predictions.values()
+)
+
+for row, scenario in enumerate(SCENARIOS):
+    for column, method in enumerate(["RF", "RFSI"]):
+        ax = axes[row, column]
+        result = predictions[(scenario, method)]
+        residual = result["predicted"] - result["observed"]
+        sc = ax.scatter(
+            result["x"], result["y"], c=residual, cmap="RdBu_r",
+            vmin=-residual_limit, vmax=residual_limit, s=48,
+            edgecolor="black", linewidth=0.2
+        )
+        ax.set_title(f"{scenario} / {method}")
+        ax.set_aspect("equal")
+        ax.set_xlabel("Easting (m)")
+        ax.set_ylabel("Northing (m)")
+
+fig.colorbar(
+    sc, ax=axes.ravel().tolist(), shrink=0.55,
+    label="Prediction − observation (mg kg$^{-1}$)"
+)
+plt.show()
+```
+
+## 10. Paired uncertainty assessment with a spatial block bootstrap
+
+The same observations and folds are used for RF and RFSI, so uncertainty should be evaluated on their **paired difference**. A naive independent-samples test would discard this pairing. A naive point bootstrap would also treat spatially correlated errors as independent.
+
+The approximation below partitions observations into ten spatial clusters, resamples whole clusters, and recalculates $\Delta RMSE = RMSE_{RFSI}-RMSE_{RF}$. A 95% interval entirely below zero supports an RFSI improvement for this CV design. An interval crossing zero means the data do not clearly distinguish the methods. This is an uncertainty/sensitivity analysis, not a definitive universal hypothesis test: the sample is small, block definitions are subjective, and OOF predictions depend on the chosen folds.
+
+```{python}
+def spatial_block_bootstrap_delta_rmse(
+    observed, pred_rf, pred_rfsi, xy,
+    n_blocks=10, n_boot=5000, random_state=RANDOM_STATE,
+):
+    xy = np.asarray(xy, dtype=float)
+    # Standardization prevents the larger coordinate range from dominating clustering.
+    xy_scaled = (xy - xy.mean(axis=0)) / xy.std(axis=0)
+    blocks = KMeans(n_clusters=n_blocks, n_init=20, random_state=random_state).fit_predict(xy_scaled)
+    block_labels = np.unique(blocks)
+    rng = np.random.default_rng(random_state)
+    deltas = np.empty(n_boot)
+
+    for b in range(n_boot):
+        sampled_blocks = rng.choice(block_labels, size=len(block_labels), replace=True)
+        index = np.concatenate([np.flatnonzero(blocks == label) for label in sampled_blocks])
+        rmse_rf = mean_squared_error(observed[index], pred_rf[index]) ** 0.5
+        rmse_rfsi = mean_squared_error(observed[index], pred_rfsi[index]) ** 0.5
+        deltas[b] = rmse_rfsi - rmse_rf
+    return deltas, blocks
+
+
+bootstrap_rows = []
+bootstrap_distributions = {}
+
+for scenario in SCENARIOS:
+    rf = predictions[(scenario, "RF")]
+    rfsi = predictions[(scenario, "RFSI")]
+    deltas, spatial_blocks = spatial_block_bootstrap_delta_rmse(
+        rf["observed"].to_numpy(),
+        rf["predicted"].to_numpy(),
+        rfsi["predicted"].to_numpy(),
+        meuse[["x", "y"]].to_numpy(),
+    )
+    bootstrap_distributions[scenario] = deltas
+    low, high = np.quantile(deltas, [0.025, 0.975])
+    bootstrap_rows.append({
+        "scenario": scenario,
+        "observed_delta_RMSE": (
+            regression_metrics(rfsi["observed"], rfsi["predicted"])["RMSE"]
+            - regression_metrics(rf["observed"], rf["predicted"])["RMSE"]
+        ),
+        "bootstrap_CI_low": low,
+        "bootstrap_CI_high": high,
+        "P(delta_RMSE < 0)": np.mean(deltas < 0),
+    })
+
+bootstrap_summary = pd.DataFrame(bootstrap_rows)
+display(bootstrap_summary.round(3))
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(9, 4.5))
+for scenario, values in bootstrap_distributions.items():
+    sns.kdeplot(values, fill=True, alpha=0.25, label=scenario, ax=ax)
+ax.axvline(0, color="black", linestyle="--", linewidth=1)
+ax.set_xlabel("ΔRMSE = RFSI − RF (negative favours RFSI)")
+ax.set_title("Spatial-block bootstrap distributions")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## 11. Fit the full models and create prediction maps
+
+Cross-validation evaluates performance; final fitting creates maps. For the final RFSI model, training-sample features exclude self, while grid-cell features use all 155 observed samples as the reference network.
+
+Only `dist`, `ffreq`, and `soil` are used because all three are available both at sample points and on `meuse.grid`. Point-only attributes such as organic matter, field elevation, lime, and land use cannot be used for wall-to-wall prediction unless equivalent raster layers are supplied for every grid cell.
+
+```{python}
+def fit_full_and_predict_grid(
+    data,
+    prediction_grid,
+    environmental_columns,
+    method,
+    k=K_NEIGHBORS,
+):
+    
+    # Environmental predictors
+    X_train = data[environmental_columns].reset_index(drop=True).copy()
+    X_grid = prediction_grid[environmental_columns].reset_index(drop=True).copy()
+
+    if method == "RFSI":
+
+        # Neighbour predictors for training locations.
+        # Each training sample is excluded from its own neighbour list.
+        train_nn = nearest_observation_features(
+            reference_xy=data[["x", "y"]],
+            reference_z=data["zinc"],
+            query_xy=data[["x", "y"]],
+            k=k,
+            exclude_self=True,
+        )
+
+        # Neighbour predictors for prediction-grid cells.
+        # All observed Meuse samples can be used as reference observations.
+        grid_nn = nearest_observation_features(
+            reference_xy=data[["x", "y"]],
+            reference_z=data["zinc"],
+            query_xy=prediction_grid[["x", "y"]],
+            k=k,
+            exclude_self=False,
+        )
+
+        X_train = pd.concat(
+            [X_train, train_nn.reset_index(drop=True)],
+            axis=1,
+        )
+
+        X_grid = pd.concat(
+            [X_grid, grid_nn.reset_index(drop=True)],
+            axis=1,
+        )
+
+    elif method != "RF":
+        raise ValueError("method must be 'RF' or 'RFSI'")
+
+    model = make_rf_pipeline(
+        feature_columns=X_train.columns.tolist(),
+        random_state=RANDOM_STATE,
+        n_trees=1000,
+    )
+
+    model.fit(X_train, data["zinc"])
+
+    prediction = model.predict(X_grid)
+
+    return model, prediction
+```
+
+```{python}
+METHODS = ["RF", "RFSI"]
+
+final_models = {}
+map_predictions = {}
+
+for scenario, environmental_columns in SCENARIOS.items():
+
+    final_models[scenario] = {}
+    map_predictions[scenario] = {}
+
+    for method in METHODS:
+
+        print(
+            f"Fitting {method} for {scenario}: "
+            f"{environmental_columns}"
+        )
+
+        model, prediction = fit_full_and_predict_grid(
+            data=meuse,
+            prediction_grid=grid,
+            environmental_columns=environmental_columns,
+            method=method,
+            k=K_NEIGHBORS,
+        )
+
+        final_models[scenario][method] = model
+        map_predictions[scenario][method] = prediction
+```
+
+```{python}
+map_frame = grid[["x", "y"]].copy()
+
+for scenario in SCENARIOS:
+
+    rf_column = f"{scenario}_RF"
+    rfsi_column = f"{scenario}_RFSI"
+    difference_column = f"{scenario}_RFSI_minus_RF"
+
+    map_frame[rf_column] = map_predictions[scenario]["RF"]
+    map_frame[rfsi_column] = map_predictions[scenario]["RFSI"]
+
+    map_frame[difference_column] = (
+        map_frame[rfsi_column]
+        - map_frame[rf_column]
+    )
+
+display(map_frame.head())
+```
+
+```{python}
+scenario_labels = {
+    "distance_only": "dist",
+    "distance_flood": "dist + ffreq",
+    "distance_flood_soil": "dist + ffreq + soil",
+}
+
+n_scenarios = len(SCENARIOS)
+
+fig, axes = plt.subplots(
+    nrows=n_scenarios,
+    ncols=3,
+    figsize=(18, 5.5 * n_scenarios),
+    sharex=True,
+    sharey=True,
+    layout="constrained",
+    squeeze=False,
+)
+
+# Remove the grid lines created by seaborn's "whitegrid" style
+for ax in axes.flat:
+    ax.grid(False)
+    ax.set_facecolor("white")
+
+
+# ---------------------------------------------------------
+# Common colour scale for all RF and RFSI predictions
+# ---------------------------------------------------------
+
+all_predictions = np.concatenate([
+    map_predictions[scenario][method]
+    for scenario in SCENARIOS
+    for method in ["RF", "RFSI"]
+])
+
+prediction_min = all_predictions.min()
+prediction_max = all_predictions.max()
+
+
+# ---------------------------------------------------------
+# Common symmetric scale for all RFSI − RF maps
+# ---------------------------------------------------------
+
+all_differences = np.concatenate([
+    map_predictions[scenario]["RFSI"]
+    - map_predictions[scenario]["RF"]
+    for scenario in SCENARIOS
+])
+
+difference_limit = np.abs(all_differences).max()
+
+
+# ---------------------------------------------------------
+# Plot every scenario
+# ---------------------------------------------------------
+
+for row, scenario in enumerate(SCENARIOS):
+
+    scenario_label = scenario_labels.get(scenario, scenario)
+
+    rf_prediction = map_predictions[scenario]["RF"]
+    rfsi_prediction = map_predictions[scenario]["RFSI"]
+    difference = rfsi_prediction - rf_prediction
+
+    # RF prediction
+    sc_prediction = axes[row, 0].scatter(
+        map_frame["x"],
+        map_frame["y"],
+        c=rf_prediction,
+        cmap="viridis",
+        vmin=prediction_min,
+        vmax=prediction_max,
+        marker="s",
+        s=12,
+        linewidths=0,
+        edgecolors="none",
+        antialiaseds=False,
+        rasterized=True,
+        zorder=1,
+    )
+
+    # RFSI prediction
+    axes[row, 1].scatter(
+        map_frame["x"],
+        map_frame["y"],
+        c=rfsi_prediction,
+        cmap="viridis",
+        vmin=prediction_min,
+        vmax=prediction_max,
+        marker="s",
+        s=12,
+        linewidths=0,
+        edgecolors="none",
+        antialiaseds=False,
+        rasterized=True,
+        zorder=1,
+    )
+
+    # RFSI − RF difference
+    sc_difference = axes[row, 2].scatter(
+        map_frame["x"],
+        map_frame["y"],
+        c=difference,
+        cmap="RdBu_r",
+        vmin=-difference_limit,
+        vmax=difference_limit,
+        marker="s",
+        s=12,
+        linewidths=0,
+        edgecolors="none",
+        antialiaseds=False,
+        rasterized=True,
+        zorder=1,
+    )
+
+    # Add sample locations
+    for column in range(3):
+
+        axes[row, column].scatter(
+            meuse["x"],
+            meuse["y"],
+            facecolors="none",
+            edgecolors="black",
+            s=18,
+            linewidths=0.4,
+            antialiaseds=True,
+            zorder=3,
+        )
+
+        axes[row, column].grid(False)
+        axes[row, column].set_aspect("equal")
+        axes[row, column].set_xlabel("Easting (m)")
+
+    axes[row, 0].set_ylabel(
+        f"{scenario_label}\nNorthing (m)"
+    )
+
+
+# ---------------------------------------------------------
+# Column titles
+# ---------------------------------------------------------
+
+axes[0, 0].set_title("RF prediction")
+axes[0, 1].set_title("RFSI prediction")
+axes[0, 2].set_title("RFSI − RF")
+
+
+# ---------------------------------------------------------
+# Colour bars
+# ---------------------------------------------------------
+
+fig.colorbar(
+    sc_prediction,
+    ax=axes[:, :2].ravel().tolist(),
+    shrink=0.75,
+    label="Predicted zinc (mg kg$^{-1}$)",
+)
+
+fig.colorbar(
+    sc_difference,
+    ax=axes[:, 2].ravel().tolist(),
+    shrink=0.75,
+    label="RFSI − RF (mg kg$^{-1}$)",
+)
+
+plt.show()
+```
+
+# REPORT
+## 1. Is there a difference in accuracy between RF and RFSI?
+
+**RFSI produced lower RMSE and MAE than RF in all three scenarios**, but the magnitude of the improvement depended strongly on the environmental covariates included in the model.
+
+| Scenario | RMSE improvement with RFSI | MAE improvement | Change in R² |
+|----------|---------------------------:|----------------:|-------------:|
+| Distance only | **25.259 mg/kg** (9.68%) | 24.978 mg/kg | +0.094 |
+| Distance + flood frequency | **7.808 mg/kg** (3.36%) | 10.762 mg/kg | +0.027 |
+| Distance + flood frequency + soil | **0.921 mg/kg** (0.42%) | 7.316 mg/kg | +0.003 |
+
+With distance to the river as the only environmental predictor, RFSI clearly outperformed RF. After flood frequency was added, RFSI remained more accurate according to RMSE, MAE and R2, but its advantage became considerably smaller. With both flood frequency and soil type included, RF and RFSI had practically identical RMSE and R2.
+
+CCC did not show a consistent RFSI advantage. RFSI reduced individual prediction errors but did not necessarily improve overall agreement in the mean and variance of predictions.
+
+The mean errors were close to zero for all models. RF showed slight underprediction, whereas RFSI showed slight overprediction.
+
+Therefore, **RFSI cannot be considered universally more accurate than RF**. It provided a meaningful advantage when environmental information was limited, but the advantage largely disappeared after relevant floodplain covariates were included.
+
+## 2. Does adding flood frequency and soil type improve prediction?
+
+**Yes.** Adding these covariates improved both methods, but the improvement was substantially larger for ordinary RF.
+
+## Conclusion
+
+These statistics demonstrate differences in predictive performance, but they do not by themselves establish statistical significance. A paired bootstrap or repeated cross-validation analysis is needed to determine whether the observed differences are greater than the uncertainty caused by the small dataset and the particular five-fold split.
+
+# ADDITIONAL SENSITIVITY ANALYSES
+## Sensitivity to the number of neighbours
+
+The OpenGeoHub example uses 10 neighbours; the original RFSI paper used 25 in its case studies and treated neighbour count as a tunable parameter. Too small $k$ may make predictions unstable; too large $k$ may dilute local information and add correlated predictors.
+
+The following is an **exploratory sensitivity analysis** using the same outer folds. Do not select the best $k$ here and then report its minimum RMSE as unbiased performance: that would tune on the evaluation folds. If formal tuning is required, $k$ must be chosen inside an inner CV loop nested within each outer fold.
+
+```{python}
+K_VALUES = [3, 5, 10, 15, 25]
+k_rows = []
+
+for scenario, columns in SCENARIOS.items():
+    for k in K_VALUES:
+        print(f"k sensitivity: {scenario}, k={k}")
+        result = cross_validate_method(
+            meuse, primary_folds, columns, "RFSI", k=k, n_trees=400
+        )
+        k_rows.append({
+            "scenario": scenario,
+            "k": k,
+            **regression_metrics(result["observed"], result["predicted"]),
+        })
+
+k_sensitivity = pd.DataFrame(k_rows)
+display(k_sensitivity.round(3))
+
+fig, ax = plt.subplots(figsize=(8, 4.5))
+sns.lineplot(data=k_sensitivity, x="k", y="RMSE", hue="scenario", marker="o", ax=ax)
+ax.set_ylabel("OOF RMSE (mg kg$^{-1}$)")
+ax.set_title("RFSI sensitivity to neighbour count")
+plt.tight_layout()
+plt.show()
+```
+
+## Repeated 5-fold sensitivity
+
+A single 5-fold split of only 155 observations can be seed-sensitive. Repeating shuffled 5-fold CV checks whether the direction and approximate size of the RFSI effect are stable across partitions. Repetitions are not independent experiments, so their percentile interval is a stability summary rather than a classical confidence interval.
+
+```{python}
+RUN_REPEATED_CV = True
+N_REPEATS = 10
+
+repeated_rows = []
+if RUN_REPEATED_CV:
+    for repeat in range(N_REPEATS):
+        folds = make_random_folds(meuse, random_state=RANDOM_STATE + repeat)
+        for scenario, columns in SCENARIOS.items():
+            repeat_metrics = {}
+            for method in ["RF", "RFSI"]:
+                result = cross_validate_method(
+                    meuse, folds, columns, method, k=K_NEIGHBORS, n_trees=300
+                )
+                repeat_metrics[method] = regression_metrics(
+                    result["observed"], result["predicted"]
+                )
+            repeated_rows.append({
+                "repeat": repeat + 1,
+                "scenario": scenario,
+                "delta_RMSE": repeat_metrics["RFSI"]["RMSE"] - repeat_metrics["RF"]["RMSE"],
+                "delta_MAE": repeat_metrics["RFSI"]["MAE"] - repeat_metrics["RF"]["MAE"],
+                "delta_R2": repeat_metrics["RFSI"]["R2"] - repeat_metrics["RF"]["R2"],
+            })
+
+    repeated_results = pd.DataFrame(repeated_rows)
+    display(repeated_results.groupby("scenario")[["delta_RMSE", "delta_MAE", "delta_R2"]]
+            .agg(["mean", "std", "min", "max"]).round(3))
+    sns.boxplot(data=repeated_results, x="scenario", y="delta_RMSE")
+    plt.axhline(0, color="black", linestyle="--", linewidth=1)
+    plt.ylabel("ΔRMSE = RFSI − RF")
+    plt.title("Sensitivity across repeated 5-fold partitions")
+    plt.show()
+else:
+    print("Repeated CV skipped. Set RUN_REPEATED_CV=True to run it.")
+```
+
+## Spatially clustered 5-fold validation
+
+Random CV answers: *How well can I interpolate unsampled points located among the remaining sample network?* A spatial-cluster test asks: *How well can I predict a geographically withheld subregion?* These are different operational tasks.
+
+RFSI normally benefits from nearby observed values. In a held-out cluster its nearest reference observations are farther away, so performance may deteriorate sharply. This is not a contradiction; it reveals that interpolation accuracy does not equal spatial extrapolation accuracy.
+
+K-means clusters are a transparent demonstration, not an optimal spatial blocking algorithm. Check maps and fold sizes before using them in a formal study.
+
+```{python}
+xy = meuse[["x", "y"]].to_numpy(dtype=float)
+xy_scaled = (xy - xy.mean(axis=0)) / xy.std(axis=0)
+cluster_id = KMeans(n_clusters=5, n_init=50, random_state=RANDOM_STATE).fit_predict(xy_scaled)
+
+spatial_folds = []
+all_index = np.arange(len(meuse))
+for cluster in np.unique(cluster_id):
+    test_index = all_index[cluster_id == cluster]
+    train_index = all_index[cluster_id != cluster]
+    spatial_folds.append((train_index, test_index))
+
+fig, ax = plt.subplots(figsize=(6, 7))
+ax.scatter(meuse["x"], meuse["y"], c=cluster_id, cmap="tab10", s=55)
+ax.set_aspect("equal")
+ax.set_title("Five spatially clustered folds")
+ax.set_xlabel("Easting (m)")
+ax.set_ylabel("Northing (m)")
+plt.show()
+
+spatial_rows = []
+for scenario, columns in SCENARIOS.items():
+    for method in ["RF", "RFSI"]:
+        result = cross_validate_method(
+            meuse, spatial_folds, columns, method, k=K_NEIGHBORS, n_trees=500
+        )
+        spatial_rows.append({
+            "scenario": scenario,
+            "method": method,
+            **regression_metrics(result["observed"], result["predicted"]),
+        })
+
+spatial_scores = pd.DataFrame(spatial_rows)
+display(spatial_scores.round(3))
+```
+
+## Log-target sensitivity
+
+Random Forest does not require a normal target, so a log transform is not mandatory. It changes the loss emphasis: fitting `log1p(zinc)` usually pays relatively more attention to proportional errors and low concentrations, while raw-scale RMSE prioritizes large absolute errors at high concentrations.
+
+If used, fit the model on `log1p(zinc)`, predict on the log scale, and back-transform with `expm1`. A simple inverse transform estimates something closer to a conditional median on the raw scale and can be downward biased for a conditional mean. For that reason, raw-zinc results remain the main answer; a rigorous mean prediction would require a retransformation correction.
+
+```{python}
+def cross_validate_log_target(data, folds, environmental_columns, method, k=K_NEIGHBORS):
+    oof = np.full(len(data), np.nan)
+    for fold_number, (train_index, test_index) in enumerate(folds, start=1):
+        train = data.iloc[train_index].reset_index(drop=True)
+        test = data.iloc[test_index].reset_index(drop=True)
+        X_train, X_test = fold_feature_tables(train, test, environmental_columns, method, k)
+        model = make_rf_pipeline(
+            X_train.columns.tolist(), random_state=RANDOM_STATE + fold_number, n_trees=500
+        )
+        model.fit(X_train, np.log1p(train["zinc"]))
+        oof[test_index] = np.expm1(model.predict(X_test))
+    return oof
+
+
+RUN_LOG_SENSITIVITY = True
+if RUN_LOG_SENSITIVITY:
+    log_rows = []
+    for scenario, columns in SCENARIOS.items():
+        for method in ["RF", "RFSI"]:
+            pred = cross_validate_log_target(meuse, primary_folds, columns, method)
+            log_rows.append({
+                "scenario": scenario,
+                "method": method,
+                **regression_metrics(meuse["zinc"], pred),
+            })
+    display(pd.DataFrame(log_rows).round(3))
+else:
+    print("Log-target sensitivity skipped. Set RUN_LOG_SENSITIVITY=True to run it.")
+```
+
+## Conclution after applying additional sensitivity analyses
+
+The sensitivity analyses confirm that the RFSI advantage is robust mainly when environmental predictors are limited. In the distance_only scenario, RFSI outperformed RF in all repeated cross-validation runs, with the strongest performance generally obtained using 3–5 neighbours. Once flood frequency and soil type were added, the RMSE advantage became small and unstable across partitions.
+
+**Spatially clustered validation reversed the result:** RFSI performed substantially worse than RF and showed strong overprediction. Thus, RFSI is useful for interpolation within a well-sampled area but is less reliable for extrapolation into geographically withheld areas. Log-transforming zinc reduced MAE but introduced systematic underprediction and did not improve raw-scale RMSE consistently. 
+
+Overall, RF with relevant environmental covariates appears more robust, while RFSI provides its clearest benefit when covariate information is sparse and nearby observations are available.
+
+
